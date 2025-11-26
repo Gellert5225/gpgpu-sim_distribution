@@ -370,6 +370,7 @@ enum concrete_scheduler {
   CONCRETE_SCHEDULER_TWO_LEVEL_ACTIVE,
   CONCRETE_SCHEDULER_RRR,
   CONCRETE_SCHEDULER_WARP_LIMITING,
+  CONCRETE_SCHEDULER_MLAWARE,
   CONCRETE_SCHEDULER_OLDEST_FIRST,
   NUM_CONCRETE_SCHEDULERS
 };
@@ -545,6 +546,33 @@ class gto_scheduler : public scheduler_unit {
   virtual void done_adding_supervised_warps() {
     m_last_supervised_issued = m_supervised_warps.begin();
   }
+};
+
+class mlaware_scheduler : public scheduler_unit {
+ public:
+  mlaware_scheduler(shader_core_stats *stats, shader_core_ctx *shader,
+                    Scoreboard *scoreboard, simt_stack **simt,
+                    std::vector<shd_warp_t *> *warp, register_set *sp_out,
+                    register_set *dp_out, register_set *sfu_out,
+                    register_set *int_out, register_set *tensor_core_out,
+                    std::vector<register_set *> &spec_cores_out,
+                    register_set *mem_out, int id)
+      : scheduler_unit(stats, shader, scoreboard, simt, warp, sp_out, dp_out,
+                       sfu_out, int_out, tensor_core_out, spec_cores_out,
+                       mem_out, id) {}
+  virtual ~mlaware_scheduler() {}
+  virtual void order_warps();
+
+  enum workload_type {
+    WL_DEFAULT = 0,
+    WL_CNN,
+    WL_TRANSFORMER,
+  };
+
+  void set_workload(workload_type w) { m_workload = w; }
+
+ protected:
+  workload_type m_workload = WL_DEFAULT;
 };
 
 class oldest_scheduler : public scheduler_unit {

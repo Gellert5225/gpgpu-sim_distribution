@@ -196,11 +196,12 @@ void shader_core_ctx::create_schedulers() {
           ? CONCRETE_SCHEDULER_TWO_LEVEL_ACTIVE
       : sched_config.find("gto") != std::string::npos ? CONCRETE_SCHEDULER_GTO
       : sched_config.find("rrr") != std::string::npos ? CONCRETE_SCHEDULER_RRR
+      : sched_config.find("mlaware") != std::string::npos     ? CONCRETE_SCHEDULER_MLAWARE
       : sched_config.find("old") != std::string::npos
-          ? CONCRETE_SCHEDULER_OLDEST_FIRST
+        ? CONCRETE_SCHEDULER_OLDEST_FIRST
       : sched_config.find("warp_limiting") != std::string::npos
-          ? CONCRETE_SCHEDULER_WARP_LIMITING
-          : NUM_CONCRETE_SCHEDULERS;
+        ? CONCRETE_SCHEDULER_WARP_LIMITING
+        : NUM_CONCRETE_SCHEDULERS;
   assert(scheduler != NUM_CONCRETE_SCHEDULERS);
 
   for (unsigned i = 0; i < m_config->gpgpu_num_sched_per_core; i++) {
@@ -237,6 +238,24 @@ void shader_core_ctx::create_schedulers() {
             &m_pipeline_reg[ID_OC_TENSOR_CORE], m_specilized_dispatch_reg,
             &m_pipeline_reg[ID_OC_MEM], i));
         break;
+      case CONCRETE_SCHEDULER_MLAWARE: {
+        mlaware_scheduler *ms = new mlaware_scheduler(
+            m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
+            &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
+            &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
+            &m_pipeline_reg[ID_OC_TENSOR_CORE], m_specilized_dispatch_reg,
+            &m_pipeline_reg[ID_OC_MEM], i);
+        // Allow optional subtype via scheduler string: e.g. "mlaware:cnn"
+        if (sched_config.find("mlaware:cnn") != std::string::npos) {
+          ms->set_workload(mlaware_scheduler::WL_CNN);
+        } else if (sched_config.find("mlaware:transformer") !=
+                   std::string::npos) {
+          ms->set_workload(mlaware_scheduler::WL_TRANSFORMER);
+        } else {
+          ms->set_workload(mlaware_scheduler::WL_DEFAULT);
+        }
+        schedulers.push_back(ms);
+      } break;
       case CONCRETE_SCHEDULER_OLDEST_FIRST:
         schedulers.push_back(new oldest_scheduler(
             m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
@@ -1602,6 +1621,65 @@ void gto_scheduler::order_warps() {
                     m_last_supervised_issued, m_supervised_warps.size(),
                     ORDERING_GREEDY_THEN_PRIORITY_FUNC,
                     scheduler_unit::sort_warps_by_oldest_dynamic_id);
+}
+
+// ML-aware scheduler ordering: compute a simple score per supervised warp
+// according to the configured workload type and sort by score. This is a
+// workload-adaptive heuristic (not calling any external ML model) that gives
+// different priorities for CNN-like (favor tensor-core ops) vs
+// transformer-like (penalize memory-heavy operations) workloads.
+void mlaware_scheduler::order_warps() {
+  m_next_cycle_prioritized_warps.clear();
+
+  std::vector<std::pair<int, shd_warp_t *>> scored;
+  scored.reserve(m_supervised_warps.size());
+
+  for (auto w : m_supervised_warps) {
+    if (w == NULL) continue;
+    if (w->done_exit() || w->waiting()) continue;
+
+    int score = 0;
+
+    // Strongly deprioritize warps waiting on instruction miss
+    if (w->imiss_pending()) {
+      score -= 100000;
+    }
+
+    // Prefer fewer in-flight instructions (lighter pipeline pressure)
+    score += 100 - (int)w->num_inst_in_pipeline();
+
+    const warp_inst_t *pI = w->ibuffer_next_inst();
+    if (pI) {
+      // Add active lane count as a small positive signal
+      score += (int)pI->active_count();
+
+      if (m_workload == WL_CNN) {
+        // CNNs often benefit from tensor core utilization
+        if (pI->op == TENSOR_CORE_OP) score += 200;
+      } else if (m_workload == WL_TRANSFORMER) {
+        // Transformers tend to be memory intensive (attention); prefer
+        // warps that are not memory ops to avoid stalling memory pipelines
+        if (pI->op == LOAD_OP || pI->op == STORE_OP) score -= 50;
+      }
+    } else {
+      // No ready instruction: deprioritize a bit
+      score -= 50;
+    }
+
+    scored.emplace_back(score, w);
+  }
+
+  std::sort(scored.begin(), scored.end(),
+            [](const std::pair<int, shd_warp_t *> &a,
+               const std::pair<int, shd_warp_t *> &b) {
+              if (a.first != b.first) return a.first > b.first;  // higher
+                                                                 // score
+                                                                 // first
+              return a.second->get_dynamic_warp_id() <
+                     b.second->get_dynamic_warp_id();
+            });
+
+  for (auto &pr : scored) m_next_cycle_prioritized_warps.push_back(pr.second);
 }
 
 void oldest_scheduler::order_warps() {

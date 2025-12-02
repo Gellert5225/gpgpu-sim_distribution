@@ -1640,30 +1640,30 @@ void mlaware_scheduler::order_warps() {
 
     int score = 0;
 
-    // Strongly deprioritize warps waiting on instruction miss
+    // Moderately deprioritize warps waiting on instruction miss
     if (w->imiss_pending()) {
-      score -= 100000;
+      score -= 500;
     }
 
-    // Prefer fewer in-flight instructions (lighter pipeline pressure)
-    score += 100 - (int)w->num_inst_in_pipeline();
+    // Prefer warps with more in-flight instructions (better pipeline utilization)
+    score += (int)w->num_inst_in_pipeline() * 2;
 
     const warp_inst_t *pI = w->ibuffer_next_inst();
     if (pI) {
-      // Add active lane count as a small positive signal
+      // Add active lane count as a positive signal
       score += (int)pI->active_count();
 
       if (m_workload == WL_CNN) {
         // CNNs often benefit from tensor core utilization
-        if (pI->op == TENSOR_CORE_OP) score += 200;
+        if (pI->op == TENSOR_CORE_OP) score += 100;
       } else if (m_workload == WL_TRANSFORMER) {
         // Transformers tend to be memory intensive (attention); prefer
         // warps that are not memory ops to avoid stalling memory pipelines
-        if (pI->op == LOAD_OP || pI->op == STORE_OP) score -= 50;
+        if (pI->op == LOAD_OP || pI->op == STORE_OP) score -= 30;
       }
     } else {
-      // No ready instruction: deprioritize a bit
-      score -= 50;
+      // No ready instruction: slight deprioritization
+      score -= 20;
     }
 
     scored.emplace_back(score, w);

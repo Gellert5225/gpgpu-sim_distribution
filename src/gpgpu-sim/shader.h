@@ -559,9 +559,13 @@ class mlaware_scheduler : public scheduler_unit {
                     register_set *mem_out, int id)
       : scheduler_unit(stats, shader, scoreboard, simt, warp, sp_out, dp_out,
                        sfu_out, int_out, tensor_core_out, spec_cores_out,
-                       mem_out, id) {}
+                       mem_out, id),
+        m_last_issued_warp(nullptr) {}
   virtual ~mlaware_scheduler() {}
   virtual void order_warps();
+  virtual void done_adding_supervised_warps() {
+    m_last_supervised_issued = m_supervised_warps.begin();
+  }
 
   enum workload_type {
     WL_DEFAULT = 0,
@@ -573,6 +577,13 @@ class mlaware_scheduler : public scheduler_unit {
 
  protected:
   workload_type m_workload = WL_DEFAULT;
+  shd_warp_t *m_last_issued_warp;  // Track last issued warp for GTO-like behavior
+
+  // Check if warp is waiting on a long memory operation
+  bool is_waiting_on_long_op(shd_warp_t *warp) const;
+  // Compute priority score for a warp
+  int compute_warp_score(shd_warp_t *warp, bool is_last_issued) const;
+
 };
 
 class oldest_scheduler : public scheduler_unit {

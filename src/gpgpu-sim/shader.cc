@@ -46,6 +46,7 @@
 #include "icnt_wrapper.h"
 #include "mem_fetch.h"
 #include "mem_latency_stat.h"
+#include "scoreboard.h"
 #include "shader_trace.h"
 #include "stat-tool.h"
 #include "traffic_breakdown.h"
@@ -1623,11 +1624,103 @@ void gto_scheduler::order_warps() {
                     scheduler_unit::sort_warps_by_oldest_dynamic_id);
 }
 
-// ML-aware scheduler ordering: compute a simple score per supervised warp
-// according to the configured workload type and sort by score. This is a
-// workload-adaptive heuristic (not calling any external ML model) that gives
-// different priorities for CNN-like (favor tensor-core ops) vs
-// transformer-like (penalize memory-heavy operations) workloads.
+// ML-aware scheduler: combines GTO-like greedy behavior with memory latency
+// hiding and workload-specific optimizations. Key insights:
+// 1. Prioritize last-issued warp (GTO-like) to exploit temporal locality
+// 2. Demote warps waiting on long memory operations to hide latency
+// 3. Favor warps with ready instructions to maximize pipeline utilization
+// 4. Apply workload-specific bonuses (tensor cores for CNN, etc.)
+
+bool mlaware_scheduler::is_waiting_on_long_op(shd_warp_t *warp) const {
+  if (warp->waiting()) return true;
+  if (warp->imiss_pending()) return true;
+
+  const warp_inst_t *inst = warp->ibuffer_next_inst();
+  if (inst) {
+    // Check if any source operand is waiting on a long operation
+    for (int i = 0; i < MAX_INPUT_VALUES; i++) {
+      if (inst->in[i] > 0 &&
+          m_scoreboard->islongop(warp->get_warp_id(), inst->in[i])) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+int mlaware_scheduler::compute_warp_score(shd_warp_t *warp,
+                                          bool is_last_issued) const {
+  int score = 0;
+
+  // GTO-like: strongly prefer last issued warp for temporal locality
+  if (is_last_issued) {
+    score += 10000;
+  }
+
+  // Penalize warps waiting on long operations (memory latency hiding)
+  if (is_waiting_on_long_op(warp)) {
+    score -= 5000;
+  }
+
+  // Instruction miss pending - strong penalty
+  if (warp->imiss_pending()) {
+    score -= 3000;
+  }
+
+  // Favor warps with instructions ready in ibuffer
+  unsigned num_ready = warp->num_inst_in_buffer();
+  score += num_ready * 500;
+
+  // Bonus for warps with issued instructions in pipeline (good momentum)
+  unsigned issued = warp->num_issued_inst_in_pipeline();
+  score += issued * 100;
+
+  const warp_inst_t *pI = warp->ibuffer_next_inst();
+  if (pI) {
+    // Active thread count - more active threads = more useful work
+    score += (int)pI->active_count() * 10;
+
+    // Workload-specific optimizations
+    if (m_workload == WL_CNN) {
+      // CNNs: tensor core operations are highly valuable
+      if (pI->op == TENSOR_CORE_OP) {
+        score += 2000;
+      }
+      // Also favor tensor core memory operations for data feeding
+      if (pI->op == TENSOR_CORE_LOAD_OP || pI->op == TENSOR_CORE_STORE_OP) {
+        score += 1000;
+      }
+    } else if (m_workload == WL_TRANSFORMER) {
+      // Transformers: attention is memory-bound, interleave compute and memory
+      // Slightly favor compute ops to let memory ops coalesce
+      if (pI->op == TENSOR_CORE_OP) {
+        score += 1500;
+      }
+      // Don't heavily penalize memory ops - they're necessary
+      // But prefer to issue them when other warps are stalled
+      if (pI->op == LOAD_OP || pI->op == STORE_OP) {
+        score -= 200;
+      }
+    } else {
+      // Default: balanced approach
+      if (pI->op == TENSOR_CORE_OP) {
+        score += 1000;
+      }
+    }
+
+    // Slight preference for non-memory ops to reduce memory pressure
+    if (pI->op != LOAD_OP && pI->op != STORE_OP &&
+        pI->op != TENSOR_CORE_LOAD_OP && pI->op != TENSOR_CORE_STORE_OP) {
+      score += 100;
+    }
+  } else {
+    // No ready instruction - deprioritize
+    score -= 1000;
+  }
+
+  return score;
+}
+
 void mlaware_scheduler::order_warps() {
   m_next_cycle_prioritized_warps.clear();
 
@@ -1638,48 +1731,28 @@ void mlaware_scheduler::order_warps() {
     if (w == NULL) continue;
     if (w->done_exit() || w->waiting()) continue;
 
-    int score = 0;
-
-    // Moderately deprioritize warps waiting on instruction miss
-    if (w->imiss_pending()) {
-      score -= 500;
-    }
-
-    // Prefer warps with more in-flight instructions (better pipeline utilization)
-    score += (int)w->num_inst_in_pipeline() * 2;
-
-    const warp_inst_t *pI = w->ibuffer_next_inst();
-    if (pI) {
-      // Add active lane count as a positive signal
-      score += (int)pI->active_count();
-
-      if (m_workload == WL_CNN) {
-        // CNNs often benefit from tensor core utilization
-        if (pI->op == TENSOR_CORE_OP) score += 100;
-      } else if (m_workload == WL_TRANSFORMER) {
-        // Transformers tend to be memory intensive (attention); prefer
-        // warps that are not memory ops to avoid stalling memory pipelines
-        if (pI->op == LOAD_OP || pI->op == STORE_OP) score -= 30;
-      }
-    } else {
-      // No ready instruction: slight deprioritization
-      score -= 20;
-    }
-
+    bool is_last = (w == m_last_issued_warp);
+    int score = compute_warp_score(w, is_last);
     scored.emplace_back(score, w);
   }
 
+  // Sort by score (descending), then by dynamic warp id for stability
   std::sort(scored.begin(), scored.end(),
             [](const std::pair<int, shd_warp_t *> &a,
                const std::pair<int, shd_warp_t *> &b) {
-              if (a.first != b.first) return a.first > b.first;  // higher
-                                                                 // score
-                                                                 // first
+              if (a.first != b.first) return a.first > b.first;
               return a.second->get_dynamic_warp_id() <
                      b.second->get_dynamic_warp_id();
             });
 
-  for (auto &pr : scored) m_next_cycle_prioritized_warps.push_back(pr.second);
+  for (auto &pr : scored) {
+    m_next_cycle_prioritized_warps.push_back(pr.second);
+  }
+
+  // Update last issued warp if we have candidates
+  if (!m_next_cycle_prioritized_warps.empty()) {
+    m_last_issued_warp = m_next_cycle_prioritized_warps.front();
+  }
 }
 
 void oldest_scheduler::order_warps() {
